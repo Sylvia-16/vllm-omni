@@ -148,6 +148,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         ]
 
         self.device = get_local_device()
+        dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
         # Check if model is a local path
         local_files_only = os.path.exists(model)
@@ -162,15 +163,20 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         self.tokenizer_3 = T5Tokenizer.from_pretrained(
             model, subfolder="tokenizer_3", local_files_only=local_files_only
         )
+        # Force text encoders to match transformer dtype; SD3.5-large ships bf16
+        # transformer weights but fp16 text-encoder weights, which causes a
+        # Conv2d dtype mismatch in PatchEmbed.proj when prompt_embeds.dtype
+        # propagates into the latents.
         self.text_encoder = CLIPTextModelWithProjection.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
+            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
         )
         self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
-            model, subfolder="text_encoder_2", local_files_only=local_files_only
+            model, subfolder="text_encoder_2", torch_dtype=dtype, local_files_only=local_files_only
         )
         self.text_encoder_3 = T5EncoderModel.from_pretrained(
             model,
             subfolder="text_encoder_3",
+            torch_dtype=dtype,
             local_files_only=local_files_only,
         )
         self.transformer = SD3Transformer2DModel(od_config=od_config)

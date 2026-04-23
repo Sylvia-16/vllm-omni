@@ -557,9 +557,21 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
-        # TODO: remove hard code
-        initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
-        self.master_port = self.settle_port(initial_master_port, 37)
+        # Honor an explicit master_port (via kwarg OR MASTER_PORT env): use
+        # that exact port and let settle_port only probe for availability
+        # (no random offset). This lets multi-process launchers like
+        # ServerlessT2I's worker_vllm_omni_proc.py assign a unique port per
+        # (rank, pipeline) and have vllm-omni actually honor it. Fall back
+        # to the old random-around-30005 behavior only when nothing is set.
+        if self.master_port is None:
+            env_port = os.environ.get("MASTER_PORT")
+            if env_port is not None:
+                self.master_port = int(env_port)
+        if self.master_port is not None:
+            self.master_port = self.settle_port(self.master_port, 37)
+        else:
+            initial_master_port = 30005 + random.randint(0, 100)
+            self.master_port = self.settle_port(initial_master_port, 37)
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig

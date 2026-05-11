@@ -244,6 +244,11 @@ class DiffusionWorker:
         assert self.model_runner is not None, "Model runner not initialized"
         return self.model_runner.load_weights(weights)
 
+    def park_to_cpu(self) -> None:
+        """Move DiT + encoder modules to CPU after inference; delegates to model runner."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        self.model_runner.park_to_cpu()
+
     def remove_lora(self, adapter_id: int) -> bool:
         return self.lora_manager.remove_adapter(adapter_id)
 

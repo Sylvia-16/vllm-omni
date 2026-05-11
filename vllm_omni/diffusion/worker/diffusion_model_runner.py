@@ -190,6 +190,24 @@ class DiffusionModelRunner:
         """Load weights into the pipeline."""
         return self.pipeline.load_weights(weights)
 
+    def park_to_cpu(self) -> None:
+        """Move DiT + encoder modules to CPU after inference.
+
+        Eliminates the idle GPU residual (11–22 GiB per pipeline) left by the
+        MODEL_LEVEL offload hook, which parks encoders but leaves DiT on GPU
+        after the last denoise step. VAE is intentionally left on GPU since it
+        has no pre_forward hook for auto-reload and is only 0.16 GiB.
+        The existing SequentialOffloadHook.pre_forward on DiT/encoders
+        automatically reloads them to GPU at the start of the next request.
+        """
+        if self.offload_backend is None:
+            return
+        from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
+        cpu = torch.device("cpu")
+        for mod in getattr(self.offload_backend, "_offload_modules", []):
+            SequentialOffloadHook._move_params(mod, cpu)
+        current_omni_platform.empty_cache()
+
     def _record_peak_memory(self, output: DiffusionOutput) -> None:
         """Record peak GPU memory for the current forward pass into output.
 

@@ -192,6 +192,7 @@ class ModelLevelOffloadBackend(OffloadBackend):
     def __init__(self, config: OffloadConfig, device: torch.device):
         super().__init__(config, device)
         self._offload_modules: list[nn.Module] = []  # Track modules with hooks
+        self._dit_modules: list[nn.Module] = []  # DiT-only subset, for selective park
 
     def enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
@@ -227,6 +228,7 @@ class ModelLevelOffloadBackend(OffloadBackend):
         )
 
         # Track modules for cleanup
+        self._dit_modules = list(modules.dits)
         self._offload_modules = [*modules.dits, *modules.encoders]
 
         self.enabled = True

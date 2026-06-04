@@ -35,6 +35,12 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 logger = logging.getLogger(__name__)
 
 
+def prepare_guidance(guidance_scale: float, latents: torch.Tensor) -> torch.Tensor:
+    """Create the guidance batch on the same device as transformer inputs."""
+    guidance = torch.full([1], guidance_scale, device=latents.device, dtype=torch.float32)
+    return guidance.expand(latents.shape[0])
+
+
 def get_flux_post_process_func(
     od_config: OmniDiffusionConfig,
 ):
@@ -422,6 +428,7 @@ class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipe
         """Diffusion loop with optional image conditioning."""
         self.scheduler.set_begin_index(0)
         self.transformer.do_true_cfg = do_true_cfg
+        _neg_forward_count = 0
         for i, t in enumerate(timesteps):
             if self.interrupt:
                 continue
@@ -444,6 +451,7 @@ class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipe
 
             # Forward pass for negative prompt (CFG)
             if do_true_cfg:
+                _neg_forward_count += 1
                 negative_kwargs = {
                     "hidden_states": latents,
                     "timestep": timestep / 1000,
@@ -470,6 +478,12 @@ class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipe
             # compute the previous noisy sample x_t -> x_t-1
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
+        print(
+            f"[OMNI-CFG-CHECK] denoise_loop done: "
+            f"steps={len(timesteps)} neg_forwards={_neg_forward_count} "
+            f"do_true_cfg={do_true_cfg}",
+            flush=True,
+        )
         return latents
 
     def check_cfg_parallel_validity(self, true_cfg_scale: float, has_neg_prompt: bool):
@@ -570,6 +584,12 @@ class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipe
             negative_prompt_embeds is not None and negative_pooled_prompt_embeds is not None
         )
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        print(
+            f"[OMNI-CFG-CHECK] do_true_cfg={do_true_cfg} "
+            f"true_cfg_scale={true_cfg_scale} has_neg_prompt={has_neg_prompt} "
+            f"cfg_world_size={get_classifier_free_guidance_world_size()}",
+            flush=True,
+        )
 
         self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
 
@@ -620,8 +640,9 @@ class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipe
 
         # handle guidance
         if self.transformer.guidance_embeds:
-            guidance = torch.full([1], guidance_scale, dtype=torch.float32)
-            guidance = guidance.expand(latents.shape[0])
+            # Diffusers' guidance embedder is an nn.Linear on the transformer
+            # device, so keep its input colocated with the latent batch.
+            guidance = prepare_guidance(guidance_scale, latents)
         else:
             guidance = None
 

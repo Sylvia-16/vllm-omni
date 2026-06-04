@@ -205,8 +205,9 @@ class DiffusionModelRunner:
         from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
         cpu = torch.device("cpu")
         for mod in getattr(self.offload_backend, "_offload_modules", []):
-            SequentialOffloadHook._move_params(mod, cpu)
+            SequentialOffloadHook._move_params(mod, cpu,non_blocking=True,pin_memory=True,)
         current_omni_platform.empty_cache()
+
 
     def _record_peak_memory(self, output: DiffusionOutput) -> None:
         """Record peak GPU memory for the current forward pass into output.

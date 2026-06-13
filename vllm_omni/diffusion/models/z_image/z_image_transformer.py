@@ -224,11 +224,12 @@ class ZImageTransformer2DModel(DiffusersZImageTransformer2DModel):
         # CachedTransformer compatibility
         self.do_true_cfg = False
 
-        # NOTE: `DiffusersPipelineLoader.load_model()` initializes this module
-        # under `set_default_torch_dtype(od_config.dtype)`, so using the current
-        # default dtype keeps `self.dtype` consistent with the actually loaded
-        # weights. This dtype is used by the pipeline to cast inputs.
-        self.dtype = torch.get_default_dtype()
+        # NOTE: do NOT assign self.dtype — the diffusers-backed base class
+        # (DiffusersZImageTransformer2DModel / ModelMixin) exposes `dtype` as a
+        # read-only property derived from the parameters. Assigning it raises
+        # "property 'dtype' has no setter". Weights load under
+        # set_default_torch_dtype(od_config.dtype), so the inherited property
+        # already returns the correct dtype.
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())

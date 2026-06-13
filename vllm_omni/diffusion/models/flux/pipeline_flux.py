@@ -17,7 +17,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoConfig, CLIPTextModel, CLIPTokenizer, T5TokenizerFast
+from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -25,9 +25,11 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.flux import FluxTransformer2DModel
+# Use the diffusers-backed transformer adapter (stock FluxTransformer2DModel)
+# instead of vllm-omni's fused-kernel custom reimplementation. See
+# flux_transformer_diffusers.py for rationale.
+from vllm_omni.diffusion.models.flux.flux_transformer_diffusers import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
-from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
@@ -82,13 +84,8 @@ class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipe
                 prefix="transformer.",
                 fall_back_to_pt=True,
             ),
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="text_encoder_2",
-                revision=None,
-                prefix="text_encoder_2.",
-                fall_back_to_pt=True,
-            ),
+            # text_encoder_2 (T5) is now loaded via T5EncoderModel.from_pretrained
+            # below, so it is intentionally NOT listed as a weights source here.
         ]
 
         self.device = get_local_device()
@@ -102,8 +99,17 @@ class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipe
         self.text_encoder = CLIPTextModel.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
         ).to(self.device)
-        t5_config = AutoConfig.from_pretrained(model, subfolder="text_encoder_2", local_files_only=local_files_only)
-        self.text_encoder_2 = T5EncoderModel(t5_config, prefix="text_encoder_2").to(self.device)
+        # Use the real transformers T5 encoder (matching diffusers FluxPipeline)
+        # instead of vllm-omni's custom reimplementation, whose output diverged
+        # from diffusers (prompt_embeds rel-diff ~1.1, causing wrong text/image).
+        # Weights are loaded here via from_pretrained, so text_encoder_2 is
+        # dropped from self.weights_sources above.
+        self.text_encoder_2 = T5EncoderModel.from_pretrained(
+            model,
+            subfolder="text_encoder_2",
+            local_files_only=local_files_only,
+            torch_dtype=od_config.dtype,
+        ).to(self.device)
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
@@ -618,6 +624,38 @@ class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipe
             generator,
             latents,
         )
+
+        # Apple-to-apple debug dump (env-gated, no effect on normal runs).
+        _dump_dir = os.environ.get("DFLOW_DUMP_DIR")
+        if _dump_dir:
+            import os as _os
+
+            _os.makedirs(_dump_dir, exist_ok=True)
+            _gen_dev = getattr(generator, "device", None)
+
+            def _dump(_name, _t):
+                if _t is None:
+                    return
+                _t = _t.detach().float().cpu()
+                torch.save(_t, _os.path.join(_dump_dir, f"{_name}.pt"))
+                logger.info(
+                    "[VLLM-DUMP] %-24s shape=%s mean=%.5f std=%.5f norm=%.3f",
+                    _name,
+                    tuple(_t.shape),
+                    _t.mean().item(),
+                    _t.std().item(),
+                    _t.norm().item(),
+                )
+
+            logger.info("[VLLM-DUMP] generator device=%s (seed-built)", _gen_dev)
+            _dump("prompt_embeds", prompt_embeds)
+            _dump("pooled_prompt_embeds", pooled_prompt_embeds)
+            _dump("text_ids", text_ids)
+            _dump("neg_prompt_embeds", negative_prompt_embeds)
+            _dump("neg_pooled_prompt_embeds", negative_pooled_prompt_embeds)
+            _dump("latents", latents)
+            _dump("latent_image_ids", latent_image_ids)
+            logger.info("[VLLM-DUMP] wrote dumps to %s", _dump_dir)
 
         # 5. Prepare timesteps
         timesteps, num_inference_steps = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])

@@ -46,7 +46,6 @@ class SD3Transformer2DModel(DiffusersSD3Transformer2DModel):
         return "transformer_blocks" in name and name.split(".")[-1].isdigit()
 
     _hsdp_shard_conditions = [_is_transformer_block]
-
     def __init__(
         self,
         od_config: OmniDiffusionConfig,

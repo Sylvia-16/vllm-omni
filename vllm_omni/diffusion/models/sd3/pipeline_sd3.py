@@ -162,16 +162,24 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         self.tokenizer_3 = T5Tokenizer.from_pretrained(
             model, subfolder="tokenizer_3", local_files_only=local_files_only
         )
+        # Load text encoders in od_config.dtype (bf16) to match the transformer.
+        # The SD3.5 checkpoint defaults to fp16, which otherwise makes
+        # prompt_embeds (and thus the latents) fp16 while the diffusers-backed
+        # SD3Transformer2DModel runs bf16 -> "Input type Half / bias BFloat16"
+        # at pos_embed. (Re-applies the 2026-04-20 dtype fix lost in a refactor.)
         self.text_encoder = CLIPTextModelWithProjection.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
+            model, subfolder="text_encoder", local_files_only=local_files_only,
+            torch_dtype=od_config.dtype,
         )
         self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
-            model, subfolder="text_encoder_2", local_files_only=local_files_only
+            model, subfolder="text_encoder_2", local_files_only=local_files_only,
+            torch_dtype=od_config.dtype,
         )
         self.text_encoder_3 = T5EncoderModel.from_pretrained(
             model,
             subfolder="text_encoder_3",
             local_files_only=local_files_only,
+            torch_dtype=od_config.dtype,
         )
         self.transformer = SD3Transformer2DModel(od_config=od_config)
 
@@ -530,7 +538,12 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         """
         self.scheduler.set_begin_index(0)
 
-        for _, t in enumerate(timesteps):
+        _dd_ts = getattr(self, "_dflow_dump_dir", None)
+        if _dd_ts:
+            torch.save(timesteps.detach().float().cpu(), os.path.join(_dd_ts, "timesteps.pt"))
+            logger.info("[VLLM-DUMP] timesteps[:5]=%s", timesteps[:5].tolist())
+
+        for _step_i, t in enumerate(timesteps):
             if self.interrupt:
                 continue
             self._current_timestep = t
@@ -564,6 +577,21 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                 negative_kwargs,
                 cfg_normalize,
             )
+
+            # Apple-to-apple: dump the step-0 combined noise prediction so the
+            # transformer forward can be diffed against stock diffusers on the
+            # identical (already-dumped) latents/embeds.
+            _dd = getattr(self, "_dflow_dump_dir", None)
+            if _dd and _step_i == 0:
+                import os as _os
+
+                torch.save(
+                    noise_pred.detach().float().cpu(), _os.path.join(_dd, "step0_noise_pred.pt")
+                )
+                logger.info(
+                    "[VLLM-DUMP] step0_noise_pred shape=%s norm=%.3f t0=%s",
+                    tuple(noise_pred.shape), noise_pred.float().norm().item(), float(timesteps[0]),
+                )
 
             # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
@@ -674,6 +702,34 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         timesteps, num_inference_steps = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])
         self._num_timesteps = len(timesteps)
 
+        # Apple-to-apple debug dump (env-gated, no effect on normal runs).
+        _dump_dir = os.environ.get("DFLOW_DUMP_DIR")
+        if _dump_dir:
+            import os as _os
+
+            _os.makedirs(_dump_dir, exist_ok=True)
+
+            def _dump(_name, _t):
+                if _t is None:
+                    return
+                _t = _t.detach().float().cpu()
+                torch.save(_t, _os.path.join(_dump_dir, f"{_name}.pt"))
+                logger.info(
+                    "[VLLM-DUMP] %-26s shape=%s mean=%.5f std=%.5f norm=%.3f",
+                    _name, tuple(_t.shape), _t.mean().item(), _t.std().item(), _t.norm().item(),
+                )
+
+            logger.info("[VLLM-DUMP] generator device=%s", getattr(generator, "device", None))
+            _dump("prompt_embeds", prompt_embeds)
+            _dump("pooled_prompt_embeds", pooled_prompt_embeds)
+            _dump("latents", latents)
+            _dump("timesteps", timesteps)
+            if do_cfg:
+                _dump("neg_prompt_embeds", negative_prompt_embeds)
+                _dump("neg_pooled_prompt_embeds", negative_pooled_prompt_embeds)
+            logger.info("[VLLM-DUMP] wrote dumps to %s", _dump_dir)
+            self._dflow_dump_dir = _dump_dir
+
         # Denoising loop using diffuse method
         latents = self.diffuse(
             latents=latents,
@@ -688,6 +744,11 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         )
 
         self._current_timestep = None
+        _dd_final = getattr(self, "_dflow_dump_dir", None)
+        if _dd_final:
+            torch.save(latents.detach().float().cpu(), os.path.join(_dd_final, "final_latents.pt"))
+            logger.info("[VLLM-DUMP] final_latents shape=%s norm=%.3f", tuple(latents.shape), latents.float().norm().item())
+
         if self.output_type == "latent":
             image = latents
         else:

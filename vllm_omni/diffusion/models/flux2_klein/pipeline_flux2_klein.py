@@ -1033,8 +1033,12 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
 
         if reference_image_latent_ids is not None:
             latent_ids = torch.cat([latent_ids, reference_image_latent_ids], dim=1)
-        elif image_latent_ids is not None:
-            latent_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
+        # NOTE: do NOT pre-extend latent_ids with image_latent_ids here. The
+        # denoise loop already appends image_latent_ids to latent_image_ids
+        # symmetrically with image_latents -> latent_model_input (matching the
+        # diffusers Flux2KleinPipeline). Pre-extending here double-counts the
+        # condition ids, making img_ids longer than hidden_states and crashing
+        # the (strict) diffusers transformer in RoPE (img2img / image-warmup).
 
         mask = None
         if mask_image is not None:
